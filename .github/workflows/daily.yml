@@ -1,17 +1,15 @@
-name: Buddy 加油站每日自动化
+name: 双账号 Buddy 每日签到
+
+# 云端 runner 执行，不依赖任何本机电源、开机状态或桌面客户端。
+# 脚本是幂等的：今日已签到会安全跳过，旅行名额用尽不会重派，
+# 因此同一天多次触发不会重复领取积分。
 
 on:
   schedule:
-    # GitHub 的 cron 是尽力而为：高负载时会延迟，甚至静默丢弃整次运行。
-    # 因此设三个时段互为备份 —— 只要有一个跑到，当天就完成了。
-    # 脚本是幂等的：已签过只会返回「今日已签过」，名额用完不会重派，
-    # 所以多触发不会重复领取。
-    #
-    # 间隔取 6 小时，是因为猫猫旅行时长最长 4 小时（travel/config 的
-    # duration_hours_max），这样下一轮运行时它必定已经到家，可以领回礼物。
-    # 三个点都落在 :10，避开 GitHub 文档提示的整点高负载期。
-    #
-    # 注意 cron 按 UTC 计时，下面是 UTC，括号内为北京时间（UTC+8）。
+    # GitHub cron 为尽力而为，高负载时可能延迟或丢弃；
+    # 设三个时段互为备份，任一跑到即完成当天任务。
+    # 间隔 6 小时 > 猫猫旅行最长 4 小时，下一轮可领回已到家的礼物。
+    # 均为 UTC，括号内为北京时间（UTC+8）。
     - cron: "10 0 * * *"    # 00:10 UTC = 08:10 北京（主时段）
     - cron: "10 6 * * *"    # 06:10 UTC = 14:10 北京（备份）
     - cron: "10 12 * * *"   # 12:10 UTC = 20:10 北京（备份）
@@ -21,66 +19,59 @@ permissions:
   contents: read
 
 concurrency:
-  group: wb-daily
+  group: wb-dual-daily
   cancel-in-progress: false
 
 jobs:
-  daily:
+  account_a:
+    name: 账号 A
     runs-on: ubuntu-latest
     timeout-minutes: 10
     steps:
       - name: 检出仓库
         uses: actions/checkout@v4
 
-      - name: 定位 Python 解释器
-        id: py
-        # 解释器路径不写死版本号，动态取 runner 上可用的解释器
-        run: |
-          set -euo pipefail
-          PY="$(command -v python3 || command -v python || true)"
-          if [ -z "$PY" ]; then
-            echo "未找到可用的 Python 解释器" >&2
-            exit 1
-          fi
-          "$PY" -c 'import sys; print("使用解释器:", sys.executable, sys.version.split()[0])'
-          echo "python_path=$PY" >> "$GITHUB_OUTPUT"
+      - name: 准备 Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
 
-      - name: 执行签到与派猫猫
-        id: run
+      - name: 执行签到与 Buddy 旅行
         env:
-          WB_ACCESS_TOKEN: ${{ secrets.WB_ACCESS_TOKEN }}
+          # 可选：在仓库 Variables 配置自定义别名（配置后通知只显示别名）
+          # 未配置时，cloud_run.py 会从令牌自动识别账号并脱敏显示
+          ACCOUNT_LABEL: ${{ vars.ACCOUNT_LABEL_A }}
+          WB_RT: ${{ secrets.WB_RT_A }}
           FEISHU_WEBHOOK: ${{ secrets.FEISHU_WEBHOOK }}
-          WB_ENDPOINT: https://copilot.tencent.com
-          WB_RESULT_FILE: ${{ runner.temp }}/wb_result.json
+          WECOM_WEBHOOK: ${{ secrets.WECOM_WEBHOOK }}
         run: |
           set -uo pipefail
-          PY="${{ steps.py.outputs.python_path }}"
-          set +e
-          "$PY" wb_auto.py
-          code=$?
-          set -e
-          echo "exit_code=$code" >> "$GITHUB_OUTPUT"
-          # 签到成功即成功：脚本自身已把猫猫失败与签到结论解耦，
-          # 这里统一以 0 退出，仅用 warning 提示存在未完成项。
-          if [ "$code" -ne 0 ]; then
-            echo "::warning::本轮存在未完成项，详见上方日志与飞书卡片"
-          fi
-          exit 0
+          # 每个账号使用独立 HOME，避免令牌文件互相覆盖
+          export HOME="$RUNNER_TEMP/acc_a"
+          mkdir -p "$HOME"
+          python scripts/cloud_run.py
 
-      - name: 汇总
-        if: always()
+  account_b:
+    name: 账号 B
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - name: 检出仓库
+        uses: actions/checkout@v4
+
+      - name: 准备 Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: 执行签到与 Buddy 旅行
         env:
-          RESULT_FILE: ${{ runner.temp }}/wb_result.json
+          ACCOUNT_LABEL: ${{ vars.ACCOUNT_LABEL_B }}
+          WB_RT: ${{ secrets.WB_RT_B }}
+          FEISHU_WEBHOOK: ${{ secrets.FEISHU_WEBHOOK }}
+          WECOM_WEBHOOK: ${{ secrets.WECOM_WEBHOOK }}
         run: |
           set -uo pipefail
-          {
-            echo "### Buddy 加油站每日自动化"
-            echo ""
-            echo "- 运行时间：$(date -u '+%Y-%m-%d %H:%M:%S UTC')（cron 为 UTC）"
-          } >> "$GITHUB_STEP_SUMMARY"
-          if [ -f "$RESULT_FILE" ]; then
-            cat "$RESULT_FILE" >> "$GITHUB_STEP_SUMMARY"
-            echo "" >> "$GITHUB_STEP_SUMMARY"
-          else
-            echo "- 未产出结论文案，请查看上方日志" >> "$GITHUB_STEP_SUMMARY"
-          fi
+          export HOME="$RUNNER_TEMP/acc_b"
+          mkdir -p "$HOME"
+          python scripts/cloud_run.py
