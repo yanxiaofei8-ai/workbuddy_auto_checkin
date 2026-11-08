@@ -36,6 +36,9 @@ jobs:
         with:
           python-version: "3.11"
 
+      - name: 安装依赖
+        run: pip install --quiet websocket-client
+
       - name: 执行签到与 Buddy 旅行
         env:
           # 可选：在仓库 Variables 配置自定义别名（配置后通知只显示别名）
@@ -44,6 +47,10 @@ jobs:
           WB_RT: ${{ secrets.WB_RT_A }}
           FEISHU_WEBHOOK: ${{ secrets.FEISHU_WEBHOOK }}
           WECOM_WEBHOOK: ${{ secrets.WECOM_WEBHOOK }}
+          # 企业微信智能机器人（API 模式 · WebSocket 长连接 · 主动推送）
+          WB_BOT_ID: ${{ secrets.WB_BOT_ID }}
+          WB_BOT_SECRET: ${{ secrets.WB_BOT_SECRET }}
+          WECOM_CHAT_ID: ${{ vars.WECOM_CHAT_ID }}
         run: |
           set -uo pipefail
           # 每个账号使用独立 HOME，避免令牌文件互相覆盖
@@ -64,12 +71,19 @@ jobs:
         with:
           python-version: "3.11"
 
+      - name: 安装依赖
+        run: pip install --quiet websocket-client
+
       - name: 执行签到与 Buddy 旅行
         env:
           ACCOUNT_LABEL: ${{ vars.ACCOUNT_LABEL_B }}
           WB_RT: ${{ secrets.WB_RT_B }}
           FEISHU_WEBHOOK: ${{ secrets.FEISHU_WEBHOOK }}
           WECOM_WEBHOOK: ${{ secrets.WECOM_WEBHOOK }}
+          # 企业微信智能机器人（API 模式 · WebSocket 长连接 · 主动推送）
+          WB_BOT_ID: ${{ secrets.WB_BOT_ID }}
+          WB_BOT_SECRET: ${{ secrets.WB_BOT_SECRET }}
+          WECOM_CHAT_ID: ${{ vars.WECOM_CHAT_ID }}
         run: |
           set -uo pipefail
           export HOME="$RUNNER_TEMP/acc_b"
