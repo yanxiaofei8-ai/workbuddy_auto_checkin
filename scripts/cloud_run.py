@@ -34,6 +34,7 @@ import os
 import subprocess
 import sys
 import time
+import uuid
 import urllib.request
 
 HERE = os.path.dirname(os.path.abspath(__file__))
@@ -124,8 +125,90 @@ def notify_all(text, targets):
             results.append("%s:未配置" % name)
             continue
         results.append(push_webhook(url, builder(text), name))
+    results.append(wecom_bot_push(text))
     print("推送: " + " | ".join(results))
     return results
+
+
+def wecom_bot_push(text):
+    """企业微信「智能机器人 API 模式」WebSocket 长连接主动推送。
+
+    需要环境变量：
+      WB_BOT_ID / WB_BOT_SECRET  机器人凭证（管理后台 API 模式生成）
+      WECOM_CHAT_ID              单聊会话 ID（即接收人的 userid）
+    未配置时返回未配置；单次失败自动重试一次（规避两个 job 并发抢连接）。
+    """
+    bot_id = (os.environ.get("WB_BOT_ID") or "").strip()
+    secret = (os.environ.get("WB_BOT_SECRET") or "").strip()
+    chat_id = (os.environ.get("WECOM_CHAT_ID") or "").strip()
+    name = "企业微信机器人"
+    if not (bot_id and secret and chat_id):
+        return "%s:未配置" % name
+    try:
+        import websocket  # websocket-client
+    except ImportError:
+        return "%s:失败(缺少 websocket-client)" % name
+
+    def once():
+        ws = websocket.create_connection(
+            "wss://openws.work.weixin.qq.com", timeout=15)
+        try:
+            rid1 = uuid.uuid4().hex
+            ws.send(json.dumps({
+                "cmd": "aibot_subscribe",
+                "headers": {"req_id": rid1},
+                "body": {"bot_id": bot_id, "secret": secret},
+            }))
+            sub = _ws_wait_ack(ws, rid1, timeout=10)
+            if not sub or sub.get("errcode") != 0:
+                raise RuntimeError("订阅失败(%s)" % (sub or {}).get("errcode"))
+            rid2 = uuid.uuid4().hex
+            ws.send(json.dumps({
+                "cmd": "aibot_send_msg",
+                "headers": {"req_id": rid2},
+                "body": {"chatid": chat_id, "chat_type": 1,
+                         "msgtype": "markdown",
+                         "markdown": {"content": text}},
+            }, ensure_ascii=False))
+            ack = _ws_wait_ack(ws, rid2, timeout=12)
+            if not ack or ack.get("errcode") != 0:
+                raise RuntimeError("发送失败(%s)" % (ack or {}).get("errcode"))
+            return True
+        finally:
+            try:
+                ws.close()
+            except Exception:
+                pass
+
+    for attempt in (1, 2):
+        try:
+            once()
+            return "%s:已推送" % name
+        except Exception as exc:
+            if attempt == 2:
+                return "%s:失败(%s)" % (name, str(exc)[:40])
+            time.sleep(3)
+
+
+def _ws_wait_ack(ws, req_id, timeout=12):
+    """按 req_id 关联等待响应帧；忽略中途收到的回调帧。"""
+    end = time.time() + timeout
+    ws.settimeout(timeout)
+    while time.time() < end:
+        try:
+            raw = ws.recv()
+        except Exception:
+            return None
+        if not raw:
+            continue
+        try:
+            data = json.loads(raw)
+        except (ValueError, TypeError):
+            continue
+        rid = (data.get("headers") or {}).get("req_id")
+        if rid == req_id:
+            return data
+    return None
 
 
 def wipe(path):
