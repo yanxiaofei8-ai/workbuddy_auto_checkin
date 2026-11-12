@@ -280,12 +280,18 @@ def main():
         ok = status == "ok"
         travel = res.get("travel") or {}
 
+        # 两个口径严格分开：balance 为账户真实可用积分余额，
+        # checkin_total_credits 为本期签到活动累计发放积分（不是余额）。
+        balance = res.get("balance")
+        ctotal = res.get("checkin_total_credits")
         lines = [title_ok if ok else title_fail,
                  "执行结果: %s" % ("成功" if ok else "需要关注"),
                  "状态: %s / %s" % (status, res.get("action")),
-                 "积分余额: %s" % (res.get("balance")
-                                  if res.get("balance") is not None else "-"),
+                 "可用积分余额: %s" % (balance if balance is not None else "未获取"),
+                 "本期签到累计: %s 积分" % (ctotal if ctotal is not None else "-"),
                  "说明: %s" % (res.get("msg") or "-")]
+        if balance is None:
+            lines.append("提示: 余额接口未返回，本期累计不等于余额，请勿按累计数理解")
         if travel.get("available"):
             lines.append("Buddy 旅行: %s · %s · %s" % (
                 travel.get("state_text") or "-",
