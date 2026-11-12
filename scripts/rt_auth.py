@@ -195,7 +195,8 @@ def run_rt(check_only=False, do_checkin=True, travel_mode="auto",
            location_id=None):
     """主流程：长效令牌 → 换新接口令牌 →（可选）签到 →（可选）派猫猫。"""
     result = {"status": "unknown", "action": None, "points": None,
-              "balance": None, "msg": "", "detail": {"channel": "rt"}}
+              "balance": None, "checkin_total_credits": None,
+              "msg": "", "detail": {"channel": "rt"}}
 
     rt = read_rt()
     if not rt:
@@ -235,7 +236,10 @@ def run_rt(check_only=False, do_checkin=True, travel_mode="auto",
         result["status"] = ck.get("status", result["status"])
         result["action"] = ck.get("action")
         result["points"] = ck.get("points")
+        # balance = 账户真实可用积分余额（资源汇总接口）
+        # checkin_total_credits = 本期签到活动累计发放积分，二者口径不同
         result["balance"] = ck.get("balance")
+        result["checkin_total_credits"] = ck.get("checkin_total_credits")
         result["msg"] = ck.get("msg", "")
         result["detail"].update(ck.get("detail", {}))
 
