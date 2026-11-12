@@ -43,6 +43,9 @@ except Exception:  # noqa: BLE001 - 模块缺失时回落到静默，不影响�
 # ---- 配置 ----
 STATUS_PATH = "/billing/meter/checkin-activity-status"
 CHECKIN_PATH = "/billing/meter/daily-checkin"
+# 账户可用积分余额接口（套餐额度）；与签到活动累计积分是两个不同口径
+RESOURCE_BASE = "https://www.workbuddy.cn"
+RESOURCE_SUMMARY_PATH = "/billing/meter/get-user-resource-summary"
 HTTP_TIMEOUT = 10
 MAX_RETRY = 1
 VERSION = "3.1.8"
@@ -105,41 +108,75 @@ def mask_token(t):
     return t[:6] + "..." + t[-4:]
 
 
-def _extract_balance(*bodies):
-    """从接口响应中尽力提取「积分余额」（total / balance 类字段）。
+def _extract_checkin_total(*bodies):
+    """提取「本期签到活动累计发放积分」（data.total_credits）。
 
-    不同版本接口返回的余额字段名不统一，这里按候选名 + 嵌套层级兜底提取，
-    找不到则返回 None（不影响签到主流程）。
+    口径说明：签到状态接口返回的 total_credits 是本期活动累计发放的签到积分
+    （约为签到天数 × 每日额度），**不是账户可用积分余额**。账户可用余额需另查
+    get-user-resource-summary，见 query_credit_balance()。历史版本把该字段当成
+    「积分余额」推送，导致通知数值与客户端实际余额不符。
     """
-    candidates = (
-        "total_credits", "total_credit", "total_credit_balance", "total_points",
-        "points_balance", "credit_balance", "balance", "remain_credit",
-        "remain_credits", "remain", "score", "credits",
-        "integral", "totalCredit", "totalCredits", "pointsBalance",
-        "balanceCredit",
-    )
-    sections = ("", "data", "result", "data.result")
     for body in bodies:
         if not isinstance(body, dict):
             continue
-        for sec in sections:
-            node = body
-            for part in sec.split(".") if sec else []:
-                if isinstance(node, dict):
-                    node = node.get(part)
-                else:
-                    node = None
-                    break
-            if not isinstance(node, dict):
-                # 顶层（sec 为空字符串）直接看 body 本身
-                node = body if sec == "" else None
+        for node in (body, body.get("data"), body.get("result")):
             if not isinstance(node, dict):
                 continue
-            for k in candidates:
-                v = node.get(k)
-                if isinstance(v, (int, float)):
-                    return v
+            v = node.get("total_credits")
+            if isinstance(v, (int, float)) and not isinstance(v, bool):
+                return v
     return None
+
+
+def _fmt_credit(value):
+    """额度字段规整为可读字符串：「1930.19」「500」；无效返回 None。"""
+    try:
+        f = float(str(value).strip())
+        if f != f or f < 0:  # NaN / 负值
+            return None
+        if f == int(f):
+            return str(int(f))
+        return ("%.2f" % f).rstrip("0").rstrip(".")
+    except Exception:
+        return None
+
+
+def query_credit_balance(token):
+    """只读查询账户真实可用积分余额（套餐剩余额度）。
+
+    口径：POST /billing/meter/get-user-resource-summary → data.TotalCredits；
+    字段缺失时回退为各套餐 CycleRemainCapacity 之和。
+    任何失败一律静默降级返回 ok=False，不影响签到主流程与退出码。
+    """
+    out = {"available": None, "main_remain": None,
+           "packages": [], "ok": False}
+    try:
+        st, body = api_call(RESOURCE_BASE, RESOURCE_SUMMARY_PATH, token)
+        if st != 200 or not isinstance(body, dict) or body.get("code") != 0:
+            return out
+        data = body.get("data")
+        if not isinstance(data, dict):
+            return out
+        pkgs = data.get("Packages")
+        if isinstance(pkgs, list):
+            for p in pkgs:
+                if isinstance(p, dict):
+                    out["packages"].append(
+                        _fmt_credit(p.get("CycleRemainCapacity")) or "-")
+        if out["packages"]:
+            out["main_remain"] = out["packages"][0]
+        total = _fmt_credit(data.get("TotalCredits"))
+        if total is None and out["packages"]:
+            try:
+                total = _fmt_credit(sum(
+                    float(x) for x in out["packages"] if x not in (None, "-")))
+            except Exception:
+                total = None
+        out["available"] = total
+        out["ok"] = total is not None
+    except Exception:
+        pass
+    return out
 
 
 # ---------------- 消息推送（多渠道，见 push_message.py） ----------------
@@ -232,7 +269,7 @@ def _push_success(res):
         if streak:
             lines += "> **连续天数**：第 %s 天\n\n" % streak
         if balance is not None:
-            lines += "> **当前积分余额**：%s\n\n" % balance
+            lines += "> **可用积分余额**：%s\n\n" % balance
         lines += "> **说明**：系统定时任务 / 技能已正常执行，无需处理。\n"
         content = lines
 
@@ -260,7 +297,7 @@ def notify_system(res):
             body = str(res.get("msg", "签到完成"))
             bal = res.get("balance")
             if bal is not None:
-                body += " ｜ 当前积分余额：" + str(bal)
+                body += " ｜ 可用积分余额：" + str(bal)
         _system_toast(title, body)
     except Exception:
         pass  # 通知失败绝不影响签到
@@ -308,9 +345,12 @@ def _win_toast(title, body):
 def _do_checkin(base, token, check_only):
     """执行签到主流程（查询状态 → 必要时领取）。返回结构化结果片段。"""
     result = {"status": "unknown", "action": None, "points": None,
-              "balance": None, "msg": "", "detail": {}}
+              "balance": None, "checkin_total_credits": None,
+              "msg": "", "detail": {}}
     attempt = 0
     last_err = None
+    # 余额与累计积分均通过结构化字段输出（balance / checkin_total_credits），
+    # 由汇总层统一排版，避免 msg 中出现两套口径或重复数值。
     while attempt <= MAX_RETRY:
         attempt += 1
         try:
@@ -318,9 +358,27 @@ def _do_checkin(base, token, check_only):
             st_code, st_body = api_call(base, STATUS_PATH, token)
             result["detail"]["status_http"] = st_code
             result["detail"]["status_resp"] = st_body
-            # 从状态响应中提前提取积分余额（领取分支会用领取响应再覆盖一次）
-            result["balance"] = _extract_balance(st_body)
-            result["detail"]["balance"] = result["balance"]
+            # 服务端 5xx 时 code 可能也是 10001（与「今日已签到」同码），
+            # 一律不得据此判定已签到，否则会漏签；先重试，仍失败则如实报错。
+            if st_code >= 500:
+                last_err = "状态接口 HTTP %s（%s）" % (
+                    st_code, str((st_body or {}).get("msg") or "")[:60])
+                if attempt <= MAX_RETRY:
+                    time.sleep(2)
+                    continue
+                result.update(status="error", action="failed",
+                              msg="签到状态查询失败: " + last_err)
+                return result
+            # 签到活动累计积分：仅作「本期累计」展示，不是账户余额
+            ctotal = _extract_checkin_total(st_body)
+            if ctotal is not None:
+                result["checkin_total_credits"] = ctotal
+                result["detail"]["checkin_total_credits"] = ctotal
+            # 账户真实可用积分余额另查资源汇总接口（只读，失败静默降级）
+            bal = query_credit_balance(token)
+            result["balance"] = bal["available"]
+            result["detail"]["balance"] = bal["available"]
+            result["detail"]["balance_detail"] = bal
 
             # 判断是否已签到：兼容多种返回形态
             today_signed = False
@@ -333,19 +391,17 @@ def _do_checkin(base, token, check_only):
                     today_signed = True
 
             if check_only:
-                bal_txt = ("，当前积分余额 %s" % result["balance"]) if result.get("balance") is not None else ""
                 result.update(
                     status="ok",
                     action="skip_check_only",
-                    msg="状态查询成功（未执行领取）" + bal_txt,
+                    msg="状态查询成功（未执行领取）",
                 )
                 result["detail"]["today_signed"] = today_signed
                 return result
 
             if today_signed:
-                bal_txt = ("，当前积分余额 %s" % result["balance"]) if result.get("balance") is not None else ""
                 result.update(status="ok", action="skip_already_signed",
-                              msg="今日已签到，无需重复领取" + bal_txt)
+                              msg="今日已签到，无需重复领取")
                 return result
 
             # 2) 领取签到
@@ -368,16 +424,15 @@ def _do_checkin(base, token, check_only):
                     credit = (ck_body.get("credit") or data.get("credit")
                               or data.get("daily_credit") or data.get("today_credit"))
                     streak = ck_body.get("streak_days") or data.get("streak_days")
-                    # 领取响应若带回余额则覆盖状态响应中的值
-                    bbal = _extract_balance(ck_body)
-                    if bbal is not None:
-                        result["balance"] = bbal
-                        result["detail"]["balance"] = bbal
-                    bal_txt = ("，当前积分余额 %s" % result["balance"]) if result.get("balance") is not None else ""
+                    # 领取响应若带回累计积分则更新「本期累计」，不触碰账户余额
+                    ctotal = _extract_checkin_total(ck_body)
+                    if ctotal is not None:
+                        result["checkin_total_credits"] = ctotal
+                        result["detail"]["checkin_total_credits"] = ctotal
                     result.update(status="ok", action="clicked",
                                   points=credit,
                                   msg="领取成功" + (("，+%s 积分" % credit) if credit else "") +
-                                      (("，连续第 %s 天" % streak) if streak else "") + bal_txt)
+                                      (("，连续第 %s 天" % streak) if streak else ""))
                     result["detail"]["streak_days"] = streak
                     return result
                 # 其余视为失败（含 2xx 但业务码异常、或非 2xx）
